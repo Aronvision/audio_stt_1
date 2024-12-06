@@ -13,7 +13,6 @@ import wave
 import numpy as np
 from faster_whisper import WhisperModel
 import speech_recognition as sr
-import noisereduce as nr
 import webrtcvad
 
 
@@ -83,19 +82,17 @@ class Audio_record:
             raise ValueError("Chunk size must be exactly 10ms, 20ms, or 30ms")
         return self.vad.is_speech(chunk.tobytes(), sample_rate)
         
-    def record_stop(self, denoise_value):
-        '''녹음이 종료되고 디노이징 과정을 거치는 함수'''
-        # thread 종료하고, 끝날 때 까지 join으로 대기
+    def record_stop(self):
+        '''녹음이 종료되는 함수'''
         self.recording = False
         self.record_thread.join()
-        # 버퍼를 하나의 오디오 데이터로 결합
-        audio_data = np.frombuffer(b''.join(self.buffer), dtype=np.int16)
-        sample_rate = self.microphone.SAMPLE_RATE
-        return self._denoise_process(audio_data, sample_rate, denoise_value)
+        # 버퍼를 오디오 데이터로 변환
+        audio_data = self._buffer_to_numpy(self.buffer, self.microphone.SAMPLE_RATE)
+        return {'audio': audio_data, 'sample_rate': self.microphone.SAMPLE_RATE}
 
     
-    def load_wav(self, path, denoise_value):
-        '''wav파일을 불러와 디노이징 과정을 거치는 함수'''
+    def load_wav(self, path):
+        '''wav파일을 불러오는 함수'''
         buffer = []
         with wave.open(path, 'rb') as wf:
             chunk_size = self.chunk_size
@@ -104,40 +101,10 @@ class Audio_record:
                 buffer.append(data)
                 data = wf.readframes(chunk_size)
 
-        audio_data = np.frombuffer(b''.join(buffer), dtype=np.int16)
-        sample_rate = wf.getframerate()
-        return self._denoise_process(audio_data, sample_rate, denoise_value)
+        audio_data = self._buffer_to_numpy(buffer, wf.getframerate())
+        return {'audio': audio_data, 'sample_rate': wf.getframerate()}
 
     
-    def _denoise_process(self, audio_data, sample_rate, denoise_value):
-        '''
-        오디오를 받아 디노이징을 적용��고, 원본과 디노이즈값둘 둘 다 저장하고 반환한다.
-        
-        audio_data : int16 np 형식 오디오 데이터. chunk를 append하여 만들어진 buffer를 다음과 같이 처리한 예시) np.frombuffer(b''.join(self.buffer), dtype=np.int16)
-        sample_rate : 샘플 레이트 입력
-        denoise_value : 디노이즈 적용값 설정
-        
-        return: {'audio_denoise': audio_denoise, 'audio_noise': audio_noise, 'sample_rate': sample_rate}
-        '''
-        # 1. 노이즈 감소 처리
-        denoise = nr.reduce_noise(y=audio_data, sr=sample_rate, prop_decrease=denoise_value)
-        buffer_denoise = [denoise.tobytes()] # 데이터를 다시 버퍼로 변환
-        # 2. 노이즈 감소 없이
-        noise = nr.reduce_noise(y=audio_data, sr=sample_rate, prop_decrease=0.0)
-        buffer_noise = [noise.tobytes()] # 데이터를 다시 버퍼로 변환
-        
-        # 1. 노이즈 감소 파일 저장
-        self._save_buffer_to_wav(buffer_denoise, self.microphone.SAMPLE_RATE, self.microphone.SAMPLE_WIDTH, 'input_denoise.wav')
-        # 2. 노이즈 감소 없는 파일 저장
-        self._save_buffer_to_wav(buffer_noise, self.microphone.SAMPLE_RATE, self.microphone.SAMPLE_WIDTH, 'input_noise.wav')
-        
-        # 오디오 소스 파일로 return
-        audio_denoise = self._buffer_to_numpy(buffer_denoise, self.microphone.SAMPLE_RATE)
-        audio_noise = self._buffer_to_numpy(buffer_noise, self.microphone.SAMPLE_RATE)
-
-        return {'audio_denoise':audio_denoise, 'audio_noise':audio_noise, 'sample_rate':self.microphone.SAMPLE_RATE}
-
-
     def _buffer_to_numpy(self, buffer, sample_rate):
         '''buffer를 입력하면 whisper에서 추론 가능한 입력 형태의 오디오로 반환'''
         audio_data = np.frombuffer(b''.join(buffer), dtype=np.int16)
@@ -156,7 +123,7 @@ class Audio_record:
 class Custom_faster_whisper:
     def __init__(self):
         '''
-        최대 4배 빠른 faster whisper를 ��용하여 cpu로 저장된 wav파일에 STT 수행
+        최대 4배 빠른 faster whisper를 이용하여 cpu로 저장된 wav파일에 STT 수행
         '''
         # 환경 설정(Window 아나콘다 환경에서 아래 코드 실행 안하면 에러남)
         try: os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "true"
@@ -226,7 +193,7 @@ class AudioSTTNode(Node):
         # 오디오 레코더 및 Whisper 모델 초기화
         self.audio_recorder = Audio_record()
         self.whisper = Custom_faster_whisper()
-        model_name = self.whisper.set_model('base')  # 원하는 모델 선택
+        model_name = self.whisper.set_model('tiny')  # 'base'에서 'tiny'로 변경
 
         # STT 처리 스레드 시작
         self.stt_thread = threading.Thread(target=self.stt_process)
@@ -244,12 +211,12 @@ class AudioSTTNode(Node):
             except KeyboardInterrupt:
                 pass
             
-            # 녹음 중지 및 디노이즈 처리
-            audio_result = self.audio_recorder.record_stop(denoise_value=0.5)
+            # 녹음 중지
+            audio_result = self.audio_recorder.record_stop()
             
             # STT 실행
             self.get_logger().info("음성을 텍스트로 변환 중...")
-            _, result_text, spent_time = self.whisper.run(audio_result['audio_denoise'], language='ko')
+            _, result_text, spent_time = self.whisper.run(audio_result['audio'], language='ko')
             
             # 결과 퍼블리시
             msg = String()
@@ -257,7 +224,7 @@ class AudioSTTNode(Node):
             self.publisher_.publish(msg)
             
             self.get_logger().info(f"텍스트: {result_text}")
-            self.get_logger().info(f"소요 시간: {spent_time}초")
+            self.get_logger().info(f"���요 시간: {spent_time}초")
 
             # 루프 계속 여부 확인
             try:
